@@ -851,8 +851,24 @@ def combine_excel_files(folder_path, output_path):
     excel_files = [f for f in os.listdir(folder_path) if f.endswith(('.xlsx', '.xls')) and f not in ["Generate.xlsx", "Profit_Center_Master.xlsx", "Profit_Center_Master_temp.xlsx"]]
     
     if not excel_files:
-        logger.warning("No Excel files found to combine")
-        return None
+        logger.warning("No Excel files found - creating empty Excel file with headers")
+        # Create empty DataFrame with required columns
+        empty_df = pd.DataFrame(columns=[
+            'Document Date', 'Posting Date', 'SKF', 'Quantity', 'Cost_Center',
+            'Client', 'Client Code', 'Business Line', 'BU', 
+            'Business Model', 'Local 1', 'General Name'
+        ])
+        
+        # Rename columns according to the mapping
+        empty_df = rename_columns(empty_df)
+        
+        # Remove specified columns
+        empty_df = remove_columns(empty_df)
+        
+        # Save empty DataFrame with headers
+        empty_df.to_excel(output_path, index=False)
+        logger.info(f"Created empty Excel file with headers at {output_path}")
+        return empty_df
     
     try:
         # Read and combine all Excel files
