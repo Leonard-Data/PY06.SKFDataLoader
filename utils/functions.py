@@ -853,23 +853,28 @@ def combine_excel_files(folder_path, output_path):
     if not excel_files:
         logger.warning("No Excel files found - creating empty Excel file with headers")
         # Create empty DataFrame with required columns
-        empty_df = pd.DataFrame(columns=[
-            'Document Date', 'Posting Date', 'SKF', 'Quantity', 'Cost_Center',
-            'Client', 'Client Code', 'Business Line', 'BU', 
-            'Business Model', 'Local 1', 'General Name'
-        ])
-        
+        empty_df = pd.DataFrame({
+            'Controlling Area': ['VN99'],
+            'Document Date': ['01'],
+            'Posting Date': ['2022'],
+            'Document Header Text': ['VN82'],
+            'SKF': ['CRL100'],
+            'Quantity': [0.0],
+            'Item_Text': ['Sample'],
+            'Cost_Center': ['8210001113'],
+        })
+
         # Rename columns according to the mapping
         empty_df = rename_columns(empty_df)
-        
-        # Remove specified columns
+
+        # Remove specified columns  
         empty_df = remove_columns(empty_df)
-        
+
         # Save empty DataFrame with headers
         empty_df.to_excel(output_path, index=False)
         logger.info(f"Created empty Excel file with headers at {output_path}")
         return empty_df
-    
+
     try:
         # Read and combine all Excel files
         for file in excel_files:
@@ -955,4 +960,3 @@ def extract_cr58d_filename(document_str):
     except Exception as e:
         logger.error(f"Error extracting cr58d_filename: {e}")
         return None
-    
