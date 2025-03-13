@@ -856,7 +856,7 @@ def combine_excel_files(folder_path, output_path):
         empty_df = pd.DataFrame({
             'Controlling Area': ['VN99'],
             'Document Date': ['01'],
-            'Posting Date': ['2022'],
+            'Posting Date': ['2025'],
             'Document Header Text': ['VN82'],
             'SKF': ['CRL100'],
             'Quantity': [0.0],
