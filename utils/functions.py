@@ -366,7 +366,7 @@ def convert_excel_to_csv_with_formatting(excel_path, csv_path):
 def Consolidation_report_masterdata(full_report_file_path, full_masterdata_file_path):
     try:
         df_report = pd.read_excel(full_report_file_path, dtype=str)
-        new_columns = ["Client", "Client Code", "Business Line", "BU", "Business Model", "Local 1","General Name"]
+        new_columns = ["Client", "Client Code", "Business Line", "BU", "Business Model", "Local 1", "General Name"]
         for col in new_columns:
             df_report[col] = None
 
@@ -414,21 +414,15 @@ def Consolidation_report_masterdata(full_report_file_path, full_masterdata_file_
 
         df_report["BU"] = df_report["Cost Center"].apply(get_bu)
 
-        report_excel_filename = os.path.splitext(os.path.basename(full_report_file_path))[0] + "_1.xlsx"
-        output_excel_path = os.path.join(os.path.dirname(full_report_file_path), report_excel_filename)
-        df_report.to_excel(output_excel_path, index=False)
+        # Tạo tên file đầu ra .parquet
+        report_parquet_filename = os.path.splitext(os.path.basename(full_report_file_path))[0] + ".parquet"
+        output_parquet_path = os.path.join(os.path.dirname(full_report_file_path), report_parquet_filename)
 
-        report_filename_csv = os.path.splitext(full_report_file_path)[0] + ".CSV"
-        output_csv_path = os.path.join(os.path.dirname(full_report_file_path), report_filename_csv)
+        # Ghi file .parquet
+        df_report.to_parquet(output_parquet_path, index=False)
+        logger.info(f"Successfully saved report to {output_parquet_path}")
 
-        try:
-            conversion_result = convert_excel_to_csv_with_formatting(output_excel_path, output_csv_path)
-            if conversion_result:
-                return output_csv_path
-            else:
-                return "Error: Conversion function returned False."
-        except Exception as e:
-            return f"Error occurred while converting Excel to CSV: {str(e)}"
+        return output_parquet_path
 
     except Exception as e:
         return f"Error: {str(e)}"
