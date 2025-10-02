@@ -30,6 +30,8 @@ from urllib.parse import quote
 import concurrent.futures
 from typing import Tuple
 from requests import post
+from utils.retry import retry_with_backoff
+from requests.exceptions import RequestException, Timeout, ConnectionError
 
 logger = setup_logger(os.path.basename(__file__))
 
@@ -89,18 +91,6 @@ def retrieve_credential(vault_path: str, token: str, name: str):
         return None
         # logger.error(f"HTTP error occurred: {err}")
 
-def get_credentials() -> requests.Response | None:
-    base_path = os.path.dirname(__file__).replace("utils","")
-    config = ConfigParser()
-    config.read([os.path.join(base_path,"config.cfg"), 
-                os.path.join(base_path,"config.dev.cfg")])
-    token = get_access_token(tenant_id=config['Graph']['tenantId'],
-            client_id=config['Graph']['clientId'],
-            client_secret=config['Graph']['clientSecret'],
-            scope=config['Graph']['scopes'])
-    vault_path = f"https://graph.microsoft.com/v1.0/sites/{config['Sharepoint']['siteID']}/drives/{config['Sharepoint']['driveID']}/{config['Sharepoint']['VaultPath']}"
-    return retrieve_credential(vault_path,token=token,name=config['Vault']['Name'])
-
 def clear_folder(destination: str):
     if os.path.isdir(destination):
           for root, dirs, files in os.walk(destination):
@@ -154,7 +144,7 @@ def upload_dataframe_to_consolidation(df: pd.DataFrame, consolidation_api: Conso
 
     return upload_results 
    
-def process_consolidation_data(input_file_path: str) -> pd.DataFrame:
+def process_consolidation_data(input_file_path: str) -> tuple[pd.DataFrame, str]:
 
     # Step 1: Read data from the Excel file
     df = pd.read_excel(input_file_path, sheet_name='Sheet1')
@@ -210,7 +200,7 @@ def process_consolidation_data(input_file_path: str) -> pd.DataFrame:
             error_message = f"Error: '{value}' is not in the company code mapping table. Stopping the process."
             logger.error(error_message)
             raise Exception(error_message)  # Stop the process and raise an error
-
+    
     # Step 10: Apply the mapping function to 'Document Header Text'
     df_result['Document Header Text'] = df_result['Document Header Text'].apply(map_header_text)
 
@@ -269,20 +259,24 @@ def create_folder():
         os.makedirs(folder_path)
         logger.info(f"Folder '{folder_path}' has been created.")
     else:
-        # If the folder exists, delete the files inside
+        # Clean up old partial downloads first
+        cleanup_partial_downloads(folder_path)
+        
+        # If the folder exists, delete the files inside (except .tmp files for resume)
         for filename in os.listdir(folder_path):
-            file_path = os.path.join(folder_path, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)  # Delete file or link
-                    logger.info(f"Deleted file: {file_path}")
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)  # Delete subdirectory
-                    logger.info(f"Deleted folder: {file_path}")
-            except Exception as e:
-                logger.error(f"Failed to delete {file_path}. Reason: {e}")
+            if not filename.endswith('.tmp'):  # Keep temp files for potential resume
+                file_path = os.path.join(folder_path, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)  # Delete file or link
+                        logger.info(f"Deleted file: {file_path}")
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)  # Delete subdirectory
+                        logger.info(f"Deleted folder: {file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to delete {file_path}. Reason: {e}")
 
-        logger.info(f"All files in '{folder_path}' have been cleared.")
+        logger.info(f"Folder '{folder_path}' has been prepared.")
     return folder_path
 
 def process_log_data(df_result: pd.DataFrame, df_consolidation: pd.DataFrame) -> str:
@@ -382,6 +376,17 @@ def Consolidation_report_masterdata(full_report_file_path, full_masterdata_file_
         df_masterdata[cost_center_column_name] = df_masterdata[cost_center_column_name].astype(str).str.strip()
         df_report["Cost Center"] = df_report["Cost Center"].astype(str).str.strip()
 
+        # Check for duplicate Cost Centers and handle them
+        duplicate_cost_centers = df_masterdata[df_masterdata.duplicated(subset=[cost_center_column_name], keep=False)]
+        if not duplicate_cost_centers.empty:
+            logger.warning(f"Found {len(duplicate_cost_centers)} duplicate Cost Centers in masterdata:")
+            for cc in duplicate_cost_centers[cost_center_column_name].unique():
+                logger.warning(f"Duplicate Cost Center: {cc}")
+            
+            # Keep only the first occurrence of each Cost Center
+            df_masterdata = df_masterdata.drop_duplicates(subset=[cost_center_column_name], keep='first')
+            logger.info(f"Removed duplicates, keeping first occurrence. Remaining records: {len(df_masterdata)}")
+
         column_mapping = {
             "Client": "Client",
             "Client Code": "Client Code",
@@ -395,7 +400,17 @@ def Consolidation_report_masterdata(full_report_file_path, full_masterdata_file_
         if not valid_columns:
             return "Error: No valid columns found in the MasterData file!"
 
-        lookup_dict = df_masterdata.set_index(cost_center_column_name)[valid_columns].to_dict(orient="index")
+        # Create lookup dictionary safely
+        try:
+            lookup_dict = df_masterdata.set_index(cost_center_column_name)[valid_columns].to_dict(orient="index")
+        except ValueError as e:
+            logger.error(f"Error creating lookup dictionary: {str(e)}")
+            # If still having issues, create manual lookup
+            lookup_dict = {}
+            for _, row in df_masterdata.iterrows():
+                cost_center = row[cost_center_column_name]
+                if cost_center not in lookup_dict:  # Only add if not already exists
+                    lookup_dict[cost_center] = {col: row[col] for col in valid_columns}
 
         for col in column_mapping.keys():
             if column_mapping[col] in valid_columns:
@@ -425,8 +440,9 @@ def Consolidation_report_masterdata(full_report_file_path, full_masterdata_file_
         return output_parquet_path
 
     except Exception as e:
+        logger.error(f"Error in Consolidation_report_masterdata: {str(e)}")
         return f"Error: {str(e)}"
-    
+   
 def ProcessMasterData(full_masterdata_file_path):
     try:
         temp_file = full_masterdata_file_path.replace(".xlsx", "_temp.xlsx")
@@ -444,13 +460,35 @@ def ProcessMasterData(full_masterdata_file_path):
             data = list(ws_pcc.iter_rows(values_only=True))
             df = pd.DataFrame(data)
             header = df.iloc[0]  
-            df = df[1:].reset_index(drop=True)  
+            df = df[1:].reset_index(drop=True)
+            df.columns = header
 
+            # Filter for Controlling Area = "VN99" TRƯỚC KHI chọn columns
+            controlling_area_col = None
+            for col in df.columns:
+                if "controlling area" in str(col).lower():
+                    controlling_area_col = col
+                    break
+            
+            if controlling_area_col is not None:
+                # Convert to string and filter
+                df[controlling_area_col] = df[controlling_area_col].astype(str).str.strip()
+                original_count = len(df)
+                df = df[df[controlling_area_col] == "VN99"]
+                filtered_count = len(df)
+                logger.info(f"Filtered masterdata: {original_count} -> {filtered_count} records (keeping only VN99)")
+                
+                if filtered_count == 0:
+                    logger.warning("No records found with Controlling Area = 'VN99'")
+            else:
+                logger.warning("Controlling Area column not found in masterdata")
+                
             columns_to_keep = [14, 15, 18, 23, 25, 29, 30]
             df = df.iloc[:, columns_to_keep]
-            df.columns = header[columns_to_keep]
+            df.columns = [header[i] for i in columns_to_keep]
             df.columns = df.columns.to_list()[:-1] + ["Client Code"]
-            df.columns = [col if col != df.columns[1] else "General Name" for col in df.columns]
+            df.columns = [col if col != df.columns[1] else "General Name" for col in df.columns]   
+        
         except Exception as e:
             return f"Error while processing data: {str(e)}"
 
@@ -516,6 +554,11 @@ def get_report_SKF(sap, month, year, folder_path, file_path):
 
     return False
 
+@retry_with_backoff(
+    max_retries=2,
+    base_delay=5.0,
+    exceptions=(RequestException, Exception)
+)
 def check_sharepoint_access(access_token, drive_id):
     headers = {
         'Authorization': f'Bearer {access_token}',
@@ -530,7 +573,12 @@ def check_sharepoint_access(access_token, drive_id):
         logger.error(f"Failed to access SharePoint. Status code: {response.status_code}")
         logger.error(f"Response: {response.text}")
         return False
- 
+
+@retry_with_backoff(
+    max_retries=2,
+    base_delay=5.0,
+    exceptions=(RequestException, Exception)
+) 
 def check_sharepoint_folder(access_token, drive_id, folder_path):
     headers = {
         'Authorization': f'Bearer {access_token}',
@@ -547,7 +595,13 @@ def check_sharepoint_folder(access_token, drive_id, folder_path):
         logger.error(f"Failed to get SharePoint folder info. Status code: {response.status_code}")
         logger.error(f"Response: {response.text}")
         return False
-       
+
+@retry_with_backoff(
+    max_retries=2,
+    base_delay=30.0,
+    timeout=300.0,
+    exceptions=(RequestException, Timeout, ConnectionError)
+)      
 def upload_file_to_sharepoint(file_path, sharepoint_folder_path):
     max_retries = 3
     chunk_size = 10 * 1024 * 1024  # 10 MB chunks
@@ -629,61 +683,168 @@ def upload_file_to_sharepoint(file_path, sharepoint_folder_path):
 
     return False
 
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=10.0,
+    timeout=300.0,
+    exceptions=(RequestException, Timeout, ConnectionError, TimeoutError)
+)
 def download_file_from_sharepoint(sharepoint_file_masterdata_path, folder_path):
-    max_retries = 3
+    """Enhanced download with resume capability and better error handling"""
     drive_id = "b!j5B2Hm8LOES-gp19kZLFNy_qoT96WGBHixaNdzAdCqJpL-7oslv5RI-IsvDE2lkX"
-
     file_name = os.path.basename(sharepoint_file_masterdata_path)
     local_file_path = os.path.join(folder_path, file_name)
+    temp_file_path = local_file_path + ".tmp"
+    
+    # Create directory if it doesn't exist
+    os.makedirs(folder_path, exist_ok=True)
+    
+    try:
+        # Check if file exists on SharePoint and get file info
+        check_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:{sharepoint_file_masterdata_path}"
+        headers = {
+            'Authorization': f'Bearer {get_current_token()}',
+            'Content-Type': 'application/json'
+        }
+        
+        logger.info(f"Checking file existence: {file_name}")
+        response = requests.get(check_url, headers=headers, timeout=30)
 
-    for attempt in range(max_retries):
-        try:
-            # Check if file exists on SharePoint
-            check_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:{sharepoint_file_masterdata_path}"
-            headers = {
-                'Authorization': f'Bearer {get_current_token()}',
-                'Content-Type': 'application/json'
-            }
-            response = requests.get(check_url, headers=headers)
+        if response.status_code == 200:
+            file_info = response.json()
+            total_size = file_info.get('size', 0)
+            logger.info(f"File '{file_name}' exists on SharePoint. Size: {total_size:,} bytes")
+        elif response.status_code == 404:
+            logger.error(f"File '{file_name}' does not exist on SharePoint.")
+            return False
+        else:
+            logger.error(f"Unexpected response when checking file existence. Status code: {response.status_code}")
+            raise Exception(f"File check failed: {response.status_code}")
 
-            if response.status_code == 200:
-                logger.info(f"File '{file_name}' exists on SharePoint, proceeding with download.")
-            elif response.status_code == 404:
-                logger.error(f"File '{file_name}' does not exist on SharePoint.")
-                return False
-            else:
-                logger.error(f"Unexpected response when checking file existence. Status code: {response.status_code}")
-                logger.error(f"Response content: {response.text}")
-                return False
-
-            # Get download URL
-            download_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:{sharepoint_file_masterdata_path}:/content"
-            response = requests.get(download_url, headers=headers, stream=True)
-
-            if response.status_code == 200:
-                # Create directory if it doesn't exist
-                os.makedirs(folder_path, exist_ok=True)
-                
-                # Write file to local directory
-                with open(local_file_path, 'wb') as file:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1 MB chunk
-                        if chunk:
-                            file.write(chunk)
-
-                logger.info(f"File downloaded successfully: {local_file_path}")
+        # Check if we have a partial download
+        start_byte = 0
+        if os.path.exists(temp_file_path):
+            start_byte = os.path.getsize(temp_file_path)
+            logger.info(f"Found partial download: {start_byte:,} bytes. Resuming...")
+            
+            # Validate partial file size
+            if start_byte >= total_size:
+                logger.info("Partial file is complete. Renaming to final file.")
+                os.rename(temp_file_path, local_file_path)
                 return True
-            else:
-                raise Exception(f"Download failed: {response.text}")
 
-        except Exception as e:
-            logger.error(f"Error during download (attempt {attempt + 1}): {str(e)}")
-            if attempt == max_retries - 1:
-                logger.error("Max retries reached. Download failed.")
-                return False
-            else:
-                time.sleep(5)  # Wait before retrying
+        # Download with chunked streaming and resume capability
+        download_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:{sharepoint_file_masterdata_path}:/content"
+        
+        # Set range header for resuming download
+        headers = {
+            'Authorization': f'Bearer {get_current_token()}',
+        }
+        
+        if start_byte > 0:
+            headers['Range'] = f'bytes={start_byte}-'
+            logger.info(f"Resuming download from byte {start_byte:,}")
+        
+        logger.info(f"Starting download from: {download_url}")
+        
+        # Use session for connection pooling
+        session = requests.Session()
+        session.headers.update({'Authorization': f'Bearer {get_current_token()}'})
+        
+        # Configure session for better performance
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=0  # We handle retries ourselves
+        )
+        session.mount('https://', adapter)
+        
+        response = session.get(
+            download_url, 
+            headers=headers if start_byte > 0 else {'Authorization': f'Bearer {get_current_token()}'}, 
+            stream=True, 
+            timeout=(30, 300)  # (connect_timeout, read_timeout)
+        )
+        
+        if response.status_code not in [200, 206]:  # 206 for partial content
+            raise Exception(f"Download failed: {response.status_code} - {response.text}")
 
-    return False
+        # Open file in append mode if resuming, otherwise write mode
+        file_mode = 'ab' if start_byte > 0 else 'wb'
+        downloaded_size = start_byte
+        chunk_size = 64 * 1024  # 64KB chunks for better performance
+        last_progress_log = 0
+        
+        logger.info(f"Starting download. Mode: {'Resume' if start_byte > 0 else 'New'}")
+        
+        with open(temp_file_path, file_mode) as file:
+            start_time = time.time()
+            
+            try:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        file.write(chunk)
+                        downloaded_size += len(chunk)
+                        
+                        # Progress logging every 5% or every 30 seconds
+                        current_time = time.time()
+                        progress_percent = (downloaded_size / total_size * 100) if total_size > 0 else 0
+                        
+                        # Log progress every 5% or every 30 seconds
+                        if (progress_percent - last_progress_log >= 5.0 or 
+                            current_time - start_time > 30):
+                            
+                            elapsed_time = current_time - start_time
+                            speed = (downloaded_size - start_byte) / elapsed_time if elapsed_time > 0 else 0
+                            speed_mb = speed / (1024 * 1024)
+                            
+                            logger.info(f"Download progress: {progress_percent:.1f}% "
+                                      f"({downloaded_size:,}/{total_size:,} bytes) "
+                                      f"Speed: {speed_mb:.2f} MB/s "
+                                      f"Elapsed: {elapsed_time:.1f}s")
+                            
+                            last_progress_log = progress_percent
+                            start_time = current_time  # Reset for next interval
+            
+            except Exception as e:
+                logger.error(f"Error during chunk download: {str(e)}")
+                raise
+        
+        # Verify download completeness
+        if downloaded_size == total_size:
+            # Rename temp file to final file
+            if os.path.exists(local_file_path):
+                os.remove(local_file_path)
+            os.rename(temp_file_path, local_file_path)
+            
+            logger.info(f"[SUCCESS] File downloaded successfully: {local_file_path}")
+            logger.info(f"Final size: {downloaded_size:,} bytes")
+            return True
+        else:
+            logger.warning(f"Download incomplete: {downloaded_size:,}/{total_size:,} bytes")
+            logger.info(f"Partial file saved as: {temp_file_path}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error during download: {str(e)}")
+        # Keep partial file for potential resume
+        if os.path.exists(local_file_path):
+            os.remove(local_file_path)
+        raise
+
+def cleanup_partial_downloads(folder_path):
+    """Clean up any .tmp files from failed downloads"""
+    try:
+        for file in os.listdir(folder_path):
+            if file.endswith('.tmp'):
+                temp_file_path = os.path.join(folder_path, file)
+                file_age = time.time() - os.path.getctime(temp_file_path)
+                # Remove temp files older than 1 hour
+                if file_age > 3600:
+                    os.remove(temp_file_path)
+                    logger.info(f"Cleaned up old partial download: {file}")
+    except Exception as e:
+        logger.warning(f"Error cleaning up partial downloads: {e}")
 
 def update_file_metadata(file_path, sharepoint_folder_path):
     try:
@@ -768,8 +929,6 @@ def update_file_version(file_path, sharepoint_folder_path):
         logger.error(f"Unable to create new version for file: {checkin_response.status_code}, {checkin_response.text}")
         return False
 
-
-
 def combine_excel_files(folder_path, output_path):
     """
     Combines Excel files, handles date formatting, and adds master data columns
@@ -790,11 +949,17 @@ def combine_excel_files(folder_path, output_path):
 
     def remove_columns(df):
         """
-        Remove specified columns from the dataframe
+        Remove specified columns from the dataframe based on existing columns
         """
-        # Get list of columns to keep (exclude columns A, D, G by their index)
-        columns_to_drop = df.columns[[0, 3, 6]]  # A=0, D=3, G=6
-        return df.drop(columns=columns_to_drop)
+        # Get current number of columns
+        num_columns = len(df.columns)
+        
+        # Define indices to drop if they exist
+        indices_to_drop = [i for i in [0, 3, 6] if i < num_columns]
+        
+        if indices_to_drop:
+            return df.drop(columns=df.columns[indices_to_drop])
+        return df
 
     def format_period_month(date_str):
         """
@@ -954,3 +1119,19 @@ def extract_cr58d_filename(document_str):
     except Exception as e:
         logger.error(f"Error extracting cr58d_filename: {e}")
         return None
+
+def convert_csv_to_parquet(csv_file, parquet_file):
+    try:
+        df = pd.read_csv(csv_file, encoding="utf-8-sig")
+        df.to_parquet(parquet_file, engine="pyarrow", index=False)
+        logger.info(f"✅ Converted {csv_file} to {parquet_file}")
+    except Exception as e:
+        logger.error(f"❌ Error during conversion: {e}")
+        
+def convert_parquet_to_csv(file_path, csv_file):
+    try:
+        df = pd.read_parquet(file_path, engine="pyarrow")
+        df.to_csv(csv_file, index=False, encoding="utf-8-sig")  
+        logger.info(f"✅ Converted {file_path} to {csv_file}")
+    except Exception as e:
+        logger.error(f"❌ Error during conversion: {e}")
