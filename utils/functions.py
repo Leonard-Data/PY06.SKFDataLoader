@@ -1,48 +1,152 @@
-from configparser import ConfigParser
 import subprocess
 import requests
-from models.consolidation import ConsolidationModel
-from APIs.consolidations import ConsolidationAPI
-from . import setup_logger
 import pandas as pd
-from auth.graphAPI import get_current_token
-import argparse
-import logging
 import os
-import threading
 import time
 import json
-import pandas as pd
-import xlsxwriter
 import shutil
-import sys
-import pytz
-import math
 import csv
+import psutil
 from datetime import datetime, timedelta, timezone
-from logging import config
 from openpyxl import load_workbook
 from xlsx2csv import Xlsx2csv
-from utils.functions import *
-from utils.log import setup_logger
-from requests.exceptions import RequestException
 from urllib.parse import quote
-import concurrent.futures
 from typing import Tuple
-from requests import post
-from utils.retry import retry_with_backoff
 from requests.exceptions import RequestException, Timeout, ConnectionError
+
+# SKF specific imports
+from models.consolidation import ConsolidationModel
+from APIs.consolidations import ConsolidationAPI
+from utils.log import setup_logger
+from auth.graphAPI import get_current_token
+from utils.retry import retry_with_backoff
 
 logger = setup_logger(os.path.basename(__file__))
 
-def kill_process(process_names: list[str])-> None:     
-    # Replace 'sapgui.exe' with the actual process name of your SAP application
+
+
+def format_period_month(value) -> str:
+    """
+    Format period/month value to standard 3-digit format (001-012).
+    Handles DDMMYYYY format (e.g., 31012026 = 31 Jan 2026 -> month = 01).
+    
+    Args:
+        value: The date value in DDMMYYYY format or simple month number
+        
+    Returns:
+        str: Formatted month string in 3-digit format (e.g., '001', '012')
+    """
+    try:
+        if pd.isna(value) or value is None or str(value).strip() == '':
+            return '001'  # Default to January if empty
+        
+        # Convert to string and clean
+        str_value = str(value).strip()
+        
+        # Handle float values (e.g., 31012026.0 -> 31012026)
+        if '.' in str_value:
+            str_value = str_value.split('.')[0]
+        
+        # Check if it's DDMMYYYY format (8 digits)
+        if len(str_value) == 8 and str_value.isdigit():
+            # Extract month from position 2-3 (DDMMYYYY)
+            month_str = str_value[2:4]
+            month_int = int(month_str)
+        elif len(str_value) <= 2 and str_value.isdigit():
+            # Simple month format (1-12 or 01-12)
+            month_int = int(str_value)
+        else:
+            # Try to parse as integer
+            month_int = int(str_value)
+            # If value > 12, it might be wrong format - log warning
+            if month_int > 12:
+                logger.warning(f"Unexpected month value '{value}', defaulting to 01")
+                month_int = 1
+        
+        # Validate month range (1-12)
+        if month_int < 1:
+            month_int = 1
+        elif month_int > 12:
+            month_int = 12
+            
+        return f"{month_int:03d}"  # Format as 3-digit string with leading zeros
+        
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Could not format period month value '{value}': {e}")
+        return '001'  # Default to January on error
+
+
+def format_fiscal_year(value) -> str:
+    """
+    Format fiscal year value to standard 4-digit format.
+    Handles DDMMYYYY format (e.g., 31012026 = 31 Jan 2026 -> year = 2026).
+    
+    Args:
+        value: The date value in DDMMYYYY format or simple year number
+        
+    Returns:
+        str: Formatted year string in 4-digit format (e.g., '2025', '2026')
+    """
+    try:
+        if pd.isna(value) or value is None or str(value).strip() == '':
+            return str(datetime.now().year)  # Default to current year if empty
+        
+        # Convert to string and clean
+        str_value = str(value).strip()
+        
+        # Handle float values (e.g., 31012026.0 -> 31012026)
+        if '.' in str_value:
+            str_value = str_value.split('.')[0]
+        
+        # Check if it's DDMMYYYY format (8 digits)
+        if len(str_value) == 8 and str_value.isdigit():
+            # Extract year from position 4-7 (DDMMYYYY)
+            year_str = str_value[4:8]
+            year_int = int(year_str)
+        elif len(str_value) == 4 and str_value.isdigit():
+            # Simple year format (e.g., 2026)
+            year_int = int(str_value)
+        else:
+            # Try to parse as integer
+            year_int = int(str_value)
+        
+        # Validate year range (reasonable fiscal years)
+        if year_int < 1900:
+            year_int = datetime.now().year
+        elif year_int > 2100:
+            year_int = datetime.now().year
+            
+        return str(year_int)
+        
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Could not format fiscal year value '{value}': {e}")
+        return str(datetime.now().year)  # Default to current year on error
+
+
+def kill_process(process_names: list[str]) -> None:     
+    """Kill specified processes if they exist using psutil"""
     for name in process_names:
+        killed_count = 0
+        process_name = name.lower()
+        
         try:
-            subprocess.run(f"taskkill /f /im {name}", shell=False, check=True)
-            logger.info(f"Successfully killed {name}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error: {e}")
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    if proc.info['name'] and proc.info['name'].lower() == process_name:
+                        proc.kill()
+                        killed_count += 1
+                        logger.info(f"Killed {name} (PID: {proc.info['pid']})")
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    # Process already gone or no permission
+                    continue
+            
+            if killed_count == 0:
+                logger.debug(f"Process {name} not running (no action needed)")
+            else:
+                logger.info(f"Successfully killed {killed_count} instance(s) of {name}")
+                
+        except Exception as e:
+            logger.warning(f"Error checking/killing {name}: {e}")
 
 def get_access_token(tenant_id, client_id, client_secret, scope) -> str | None:
         """
@@ -934,9 +1038,7 @@ def combine_excel_files(folder_path, output_path):
     Combines Excel files, handles date formatting, and adds master data columns
     """
     def rename_columns(df):
-        """
-        Rename columns according to the specified mapping
-        """
+        """Rename columns according to the specified mapping"""
         column_mapping = {
             'Document Date': 'Period',
             'Posting Date': 'Fiscal Year',
@@ -944,96 +1046,56 @@ def combine_excel_files(folder_path, output_path):
             'Quantity': 'Statistical quantity',
             'Cost_Center': 'Cost Center'
         }
-        
         return df.rename(columns=column_mapping)
 
     def remove_columns(df):
-        """
-        Remove specified columns from the dataframe based on existing columns
-        """
-        # Get current number of columns
+        """Remove specified columns from the dataframe based on existing columns"""
         num_columns = len(df.columns)
-        
-        # Define indices to drop if they exist
         indices_to_drop = [i for i in [0, 3, 6] if i < num_columns]
-        
         if indices_to_drop:
             return df.drop(columns=df.columns[indices_to_drop])
         return df
 
-    def format_period_month(date_str):
-        """
-        Extract month from date string and format as '0XX'
-        Example: '31012025' -> '001'
-        """
-        try:
-            # Extract month (positions 2-4)
-            month = date_str[2:4]
-            # Convert to number and format with leading zeros (3 digits)
-            return f"{int(month):03d}"
-        except Exception as e:
-            logger.error(f"Error formatting period month: {str(e)}")
-            return date_str
-
-    def format_fiscal_year(date_str):
-        """
-        Extract year from date string (last 4 characters)
-        Example: '31012025' -> '2025'
-        """
-        try:
-            # Extract last 4 characters
-            year = date_str[-4:]
-            return str(year)
-        except Exception as e:
-            logger.error(f"Error formatting fiscal year: {str(e)}")
-            return date_str
-
     def add_master_columns(df):
-        """
-        Add master data columns with default None values
-        """
+        """Add master data columns with default None values"""
         new_columns = [
-            "Client",
-            "Client Code",
-            "Business Line",
-            "BU",
-            "Business Model", 
-            "Local 1",
-            "General Name"
+            "Client", "Client Code", "Business Line", "BU",
+            "Business Model", "Local 1", "General Name"
         ]
-        
         for col in new_columns:
             df[col] = None
-    
         return df
+
     all_dfs = []
-    excel_files = [f for f in os.listdir(folder_path) if f.endswith(('.xlsx', '.xls')) and f not in ["Generate.xlsx", "Profit_Center_Master.xlsx", "Profit_Center_Master_temp.xlsx"]]
+    excel_files = [f for f in os.listdir(folder_path) 
+                   if f.endswith(('.xlsx', '.xls')) and 
+                   f not in ["Generate.xlsx", "Profit_Center_Master.xlsx", "Profit_Center_Master_temp.xlsx"]]
     
     if not excel_files:
-        logger.warning("No Excel files found - creating empty Excel file with headers")
-        # Create empty DataFrame with required columns
+        logger.warning("No Excel files found - creating empty Excel file with sample data")
+        # Create empty DataFrame with required columns and zero values
         empty_df = pd.DataFrame({
             'Controlling Area': ['VN99'],
-            'Document Date': ['01'],
-            'Posting Date': ['2025'],
+            'Document Date': ['001'],  # Month format
+            'Posting Date': ['2025'],  # Year format
             'Document Header Text': ['VN82'],
             'SKF': ['CRL100'],
-            'Quantity': [0.0],
-            'Item_Text': ['Sample'],
+            'Quantity': [0.0],  # Zero quantity as requested
+            'Item_Text': ['No Data Available'],
             'Cost_Center': ['8210001113'],
         })
 
-        # Rename columns according to the mapping
+        # Apply transformations like real data
         empty_df = rename_columns(empty_df)
-
-        # Remove specified columns  
         empty_df = remove_columns(empty_df)
+        empty_df = add_master_columns(empty_df)
 
-        # Save empty DataFrame with headers
+        # Save empty DataFrame
         empty_df.to_excel(output_path, index=False)
-        logger.info(f"Created empty Excel file with headers at {output_path}")
+        logger.info(f"Created empty Excel file with zero values at {output_path}")
         return empty_df
 
+    # Normal processing for existing files
     try:
         # Read and combine all Excel files
         for file in excel_files:
@@ -1073,19 +1135,16 @@ def combine_excel_files(folder_path, output_path):
                 continue
         
         if not all_dfs:
-            logger.error("No valid data found in any Excel files")
-            return None
+            logger.warning("No valid data found in any Excel files - creating empty file")
+            # Fallback to empty file creation
+            return combine_excel_files(folder_path, output_path)  # Recursive call will hit the empty case
             
         # Combine all dataframes
         combined_df = pd.concat(all_dfs, ignore_index=True)
         
-        # Rename columns
+        # Apply transformations
         combined_df = rename_columns(combined_df)
-        
-        # Remove specified columns
         combined_df = remove_columns(combined_df)
-        
-        # Add master data columns
         combined_df = add_master_columns(combined_df)
         
         # Save to Excel
@@ -1099,8 +1158,6 @@ def combine_excel_files(folder_path, output_path):
             os.remove(output_path)
             logger.info(f"Removed incomplete output file: {output_path}")
         raise
-    
-    return None
 
 def download_file_wrapper(args: Tuple[str, str, str]) -> Tuple[bool, str, str]:
     id, file_name, folder_path = args
