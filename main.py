@@ -33,14 +33,38 @@ logger = setup_logger(os.path.basename(__file__))
 def check_running_instances():
     """Check if another instance is already running"""
     import psutil
+    import time
     current_pid = os.getpid()
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Wait a moment for any quick-exit processes to finish
+    time.sleep(0.5)
+    
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time', 'cwd']):
         try:
             if (proc.info['name'] == 'python.exe' and 
-                proc.info['pid'] != current_pid and
-                'main.py' in ' '.join(proc.info['cmdline'] or [])):
-                logger.warning(f"Another instance is running (PID: {proc.info['pid']})")
-                return True
+                proc.info['pid'] != current_pid):
+                
+                cmdline = ' '.join(proc.info['cmdline'] or [])
+                
+                # Only check for PY06 main.py specifically (not PY02/PY03)
+                if 'main.py' in cmdline and 'PY06' in cmdline:
+                    # Check if process has been running for more than 10 seconds
+                    process_age = time.time() - proc.info['create_time']
+                    if process_age > 10:
+                        logger.warning(f"Another PY06 instance is running (PID: {proc.info['pid']}, age: {process_age:.1f}s)")
+                        return True
+                # Fallback: check if running from same directory
+                elif 'main.py' in cmdline:
+                    try:
+                        proc_cwd = proc.info.get('cwd') or proc.cwd()
+                        if proc_cwd and current_script_dir in proc_cwd:
+                            process_age = time.time() - proc.info['create_time']
+                            if process_age > 10:
+                                logger.warning(f"Another instance in same directory (PID: {proc.info['pid']}, age: {process_age:.1f}s)")
+                                return True
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        pass
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return False
